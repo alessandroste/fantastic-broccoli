@@ -1,0 +1,223 @@
+name: Release Windows portable apps
+
+on:
+  push:
+    tags:
+      - "v*.*.*-r*"
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Wrapper revision for the pinned upstream release (1, 2, 3, ...)
+        required: true
+        default: "1"
+        type: string
+      draft:
+        description: Create the GitHub Release as a draft
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}-${{ inputs.revision || 'tag' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release version
+    runs-on: ubuntu-24.04
+    outputs:
+      asset_version: ${{ steps.version.outputs.asset_version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      # actions/checkout v4.4.0
+      - name: Check out wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      # actions/setup-node v4.4.0
+      - name: Set up Node 26
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 26.7.0
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          MANUAL_REVISION: ${{ inputs.revision }}
+          TRIGGER_TAG: ${{ github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+
+          const upstream = JSON.parse(fs.readFileSync('upstream.json', 'utf8'))
+          if (!/^v[0-9]{4}\.[0-9]+\.[0-9]+$/.test(upstream.tag)) {
+            throw new Error(`Invalid pinned upstream tag "${upstream.tag}".`)
+          }
+
+          const triggerTag = String(process.env.TRIGGER_TAG || '').trim()
+          let releaseTag
+
+          if (triggerTag) {
+            const expected = new RegExp(`^${upstream.tag.replaceAll('.', '\\.')}\\-r[1-9][0-9]*$`)
+            if (!expected.test(triggerTag)) {
+              throw new Error(
+                `Tag "${triggerTag}" must match pinned upstream ${upstream.tag} with a positive -rN revision.`
+              )
+            }
+            releaseTag = triggerTag
+          } else {
+            const revision = String(process.env.MANUAL_REVISION || '').trim()
+            if (!/^[1-9][0-9]*$/.test(revision)) {
+              throw new Error(`Revision must be a positive integer, got "${revision}".`)
+            }
+            releaseTag = `${upstream.tag}-r${revision}`
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `release_tag=${releaseTag}\n`)
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `asset_version=${releaseTag.slice(1)}\n`)
+          NODE
+
+      - name: Refuse an existing release tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${RELEASE_TAG} already exists."
+            exit 1
+          fi
+
+  build:
+    name: Windows ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-vs2026-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    steps:
+      # actions/checkout v4.4.0
+      - name: Check out wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      # actions/setup-node v4.4.0
+      - name: Set up Node 26
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 26.7.0
+
+      - name: Initialize sparse Hermes submodule
+        shell: pwsh
+        run: node scripts/wrapper.mjs submodule
+
+      - name: Assert runner architecture
+        shell: pwsh
+        run: |
+          $actual = node -p "process.platform + '-' + process.arch"
+          if ($actual -ne "win32-${{ matrix.arch }}") {
+            throw "Expected win32-${{ matrix.arch }}, got $actual"
+          }
+
+      - name: Set up dependencies
+        shell: pwsh
+        run: npm run setup
+
+      - name: Build portable executable
+        shell: pwsh
+        run: npm run build:${{ matrix.arch }}
+
+      - name: Validate package
+        shell: pwsh
+        run: npm run validate:${{ matrix.arch }}
+
+      # actions/upload-artifact v4.6.2
+      - name: Upload validated build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hermes-windows-${{ needs.prepare.outputs.release_tag }}-${{ matrix.arch }}
+          path: |
+            artifacts/**/${{ matrix.arch }}/*.exe
+            artifacts/**/${{ matrix.arch }}/*.sha256
+            artifacts/**/${{ matrix.arch }}/manifest.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download validated matrix builds
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir downloaded
+
+      - name: Prepare release assets
+        shell: bash
+        env:
+          ASSET_VERSION: ${{ needs.prepare.outputs.asset_version }}
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+
+          for arch in x64 arm64; do
+            source="$(find downloaded -type f -name "Hermes-*-win-${arch}.exe" -print -quit)"
+            if [[ -z "$source" ]]; then
+              echo "::error::Missing ${arch} portable executable."
+              exit 1
+            fi
+
+            name="Hermes-${ASSET_VERSION}-win-${arch}.exe"
+            cp "$source" "release-assets/$name"
+            digest="$(sha256sum "release-assets/$name" | awk '{print $1}')"
+            printf '%s  %s\n' "$digest" "$name" >"release-assets/$name.sha256"
+          done
+
+          cat release-assets/*.exe.sha256 >release-assets/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          CREATE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          args=(
+            "$RELEASE_TAG"
+            release-assets/*
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "Hermes Desktop $RELEASE_TAG"
+            --generate-notes
+          )
+
+          if [[ "$CREATE_DRAFT" == "true" ]]; then
+            args+=(--draft)
+          fi
+
+          gh release create "${args[@]}"

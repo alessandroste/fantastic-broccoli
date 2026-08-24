@@ -1,0 +1,473 @@
+diff --git a/apps/desktop/electron/connection-registry.test.ts b/apps/desktop/electron/connection-registry.test.ts
+index d357597a0..cd77e093a 100644
+--- a/apps/desktop/electron/connection-registry.test.ts
++++ b/apps/desktop/electron/connection-registry.test.ts
+@@ -25,6 +25,8 @@ import {
+   normalizeConnectionInput,
+   normalizeRegistry,
+   parseRemoteProfileListing,
++  reconcileLocalOnlyRegistryFromV1,
++  reconcileV1GlobalConnection,
+   REGISTRY_VERSION,
+   rememberSshEnumeration,
+   removeConnection,
+@@ -881,6 +883,170 @@ test('migrate: duplicate host labels are suffixed, not dropped', () => {
+   assert.equal(registry.connections.length, 3)
+ })
+ 
++test('reconcile: first-run remote apply replaces the stale local startup target', () => {
++  const registry = emptyRegistry()
++  const remote = {
++    mode: 'remote',
++    remote: {
++      url: 'https://gateway.example.com/hermes',
++      authMode: 'oauth',
++      headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'id' } }
++    }
++  }
++
++  const reconciled = reconcileV1GlobalConnection(registry, remote, {
++    activate: true,
++    previousV1: { mode: 'local' }
++  })
++
++  const selected = reconciled.connections.find(connection => connection.id === reconciled.primary)
++
++  assert.equal(selected?.kind, 'remote')
++  assert.equal(selected?.url, 'https://gateway.example.com/hermes')
++  assert.equal(selected?.authMode, 'oauth')
++  assert.deepEqual(selected?.headers, {
++    'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'id' }
++  })
++  assert.equal(reconciled.lastUsed, reconciled.primary)
++  assert.equal(reconciled.connections.filter(connection => connection.kind === 'local').length, 1)
++})
++
++test('reconcile: editing the legacy remote updates its registry entry without dropping other sources', () => {
++  let registry = emptyRegistry()
++  const oldConfig = {
++    mode: 'remote',
++    remote: { url: 'https://old.example.com', authMode: 'token', token: { enc: 'old' } }
++  }
++
++  registry = reconcileV1GlobalConnection(registry, oldConfig, { activate: true })
++  const originalId = registry.primary
++  const originalLabel = registry.connections.find(connection => connection.id === originalId)?.label
++  const extra = normalizeConnectionInput(
++    { kind: 'remote', label: 'Other', url: 'https://other.example.com', authMode: 'oauth' },
++    registry
++  )
++
++  registry = upsertConnection(registry, extra)
++
++  const reconciled = reconcileV1GlobalConnection(
++    registry,
++    {
++      mode: 'remote',
++      remote: { url: 'https://new.example.com', authMode: 'token', token: { enc: 'new' } }
++    },
++    { activate: true, previousV1: oldConfig }
++  )
++
++  const selected = reconciled.connections.find(connection => connection.id === originalId)
++
++  assert.equal(reconciled.primary, originalId)
++  assert.equal(reconciled.lastUsed, originalId)
++  assert.equal(selected?.label, originalLabel)
++  assert.equal(selected?.url, 'https://new.example.com')
++  assert.deepEqual(selected?.token, { enc: 'new' })
++  assert.ok(reconciled.connections.some(connection => connection.id === extra.id))
++  assert.equal(reconciled.connections.length, 3)
++})
++
++test('reconcile: legacy save preserves registry-only gateway fields', () => {
++  let registry = emptyRegistry()
++  const existing = normalizeConnectionInput(
++    {
++      authMode: 'oauth',
++      headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'id' } },
++      kind: 'remote',
++      label: 'Protected gateway',
++      url: 'https://protected.example.com'
++    },
++    registry
++  )
++
++  registry = upsertConnection(registry, existing)
++
++  const reconciled = reconcileV1GlobalConnection(
++    registry,
++    {
++      mode: 'remote',
++      remote: { url: 'https://protected.example.com', authMode: 'oauth' }
++    },
++    { activate: true, previousV1: { mode: 'local' } }
++  )
++
++  assert.deepEqual(reconciled.connections.find(connection => connection.id === existing.id)?.headers, {
++    'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'id' }
++  })
++})
++
++test('reconcile: save updates the next-launch primary without changing the last-used source', () => {
++  const reconciled = reconcileV1GlobalConnection(
++    emptyRegistry(),
++    {
++      mode: 'remote',
++      remote: { url: 'https://saved.example.com', authMode: 'oauth' }
++    },
++    { activate: false, previousV1: { mode: 'local' } }
++  )
++
++  assert.notEqual(reconciled.primary, LOCAL_CONNECTION_ID)
++  assert.equal(reconciled.lastUsed, LOCAL_CONNECTION_ID)
++  assert.equal(
++    reconciled.connections.find(connection => connection.id === reconciled.primary)?.url,
++    'https://saved.example.com'
++  )
++})
++
++test('reconcile: omitting previous config safely adds a different remote', () => {
++  let registry = reconcileV1GlobalConnection(
++    emptyRegistry(),
++    {
++      mode: 'remote',
++      remote: { url: 'https://old.example.com', authMode: 'oauth' }
++    },
++    { activate: true }
++  )
++
++  registry = reconcileV1GlobalConnection(
++    registry,
++    {
++      mode: 'remote',
++      remote: { url: 'https://new.example.com', authMode: 'oauth' }
++    },
++    { activate: true }
++  )
++
++  assert.equal(registry.connections.filter(connection => connection.kind === 'remote').length, 2)
++  assert.equal(registry.connections.find(connection => connection.id === registry.primary)?.url, 'https://new.example.com')
++})
++
++test('reconcile: stale local-only registry self-heals from the configured remote', () => {
++  const repaired = reconcileLocalOnlyRegistryFromV1(emptyRegistry(), {
++    mode: 'remote',
++    remote: { url: 'https://gateway.example.com', authMode: 'oauth' }
++  })
++
++  assert.notEqual(repaired.primary, LOCAL_CONNECTION_ID)
++  assert.equal(repaired.lastUsed, repaired.primary)
++  assert.equal(repaired.connections.find(connection => connection.id === repaired.primary)?.url, 'https://gateway.example.com')
++})
++
++test('reconcile: compatibility repair never overwrites a multi-source registry', () => {
++  let registry = emptyRegistry()
++  const saved = normalizeConnectionInput(
++    { kind: 'remote', label: 'Saved gateway', url: 'https://saved.example.com', authMode: 'oauth' },
++    registry
++  )
++
++  registry = upsertConnection(registry, saved)
++
++  assert.equal(
++    reconcileLocalOnlyRegistryFromV1(registry, {
++      mode: 'remote',
++      remote: { url: 'https://legacy.example.com', authMode: 'oauth' }
++    }),
++    registry
++  )
++})
++
+ // --- registry operations ---
+ 
+ test('removeConnection: local refuses, primary and last-used retarget safely', () => {
+diff --git a/apps/desktop/electron/connection-registry.ts b/apps/desktop/electron/connection-registry.ts
+index cec23fea9..3f5f7ed48 100644
+--- a/apps/desktop/electron/connection-registry.ts
++++ b/apps/desktop/electron/connection-registry.ts
+@@ -1057,6 +1057,134 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
+   return { version: REGISTRY_VERSION, primary, launchMode: 'primary', lastUsed: primary, connections }
+ }
+ 
++function sameConnectionTarget(left: RegistryConnection, right: RegistryConnection): boolean {
++  if (
++    (left.kind === 'remote' || left.kind === 'cloud') &&
++    (right.kind === 'remote' || right.kind === 'cloud')
++  ) {
++    try {
++      return normalizeRemoteBaseUrl(left.url) === normalizeRemoteBaseUrl(right.url)
++    } catch {
++      return false
++    }
++  }
++
++  if (left.kind !== 'ssh' || right.kind !== 'ssh') {
++    return false
++  }
++
++  const key = (connection: RegistryConnection) =>
++    `${String(connection.user || '').trim().toLowerCase()}@` +
++    `${String(connection.host || '').trim().toLowerCase()}:` +
++    `${connection.port || 22}::${String(connection.remoteProfile || '').trim()}`
++
++  return key(left) === key(right)
++}
++
++function migratedGlobalConnection(v1: unknown): RegistryConnection {
++  const migrated = migrateV1ToRegistry(v1)
++
++  return (
++    migrated.connections.find(connection => connection.id === migrated.primary) ||
++    migrated.connections.find(connection => connection.kind === 'local')!
++  )
++}
++
++/**
++ * Keep the v2 registry aligned when the legacy connection-mode form writes
++ * connection.json after connections.json has already been created.
++ *
++ * First-run startup reads the registry before showing the Local/Remote choice,
++ * so the one-time migration has already persisted a local-only registry by the
++ * time an OIDC remote is applied. Without this reconciliation, the remote
++ * connection resumes successfully but Sessions immediately restores the stale
++ * local primary and starts the Python installer.
++ */
++export function reconcileV1GlobalConnection(
++  registry: ConnectionRegistry,
++  nextV1: unknown,
++  options: { activate?: boolean; previousV1?: unknown } = {}
++): ConnectionRegistry {
++  const candidate = migratedGlobalConnection(nextV1)
++
++  if (candidate.kind === 'local') {
++    return {
++      ...registry,
++      primary: LOCAL_CONNECTION_ID,
++      ...(options.activate ? { lastUsed: LOCAL_CONNECTION_ID } : {})
++    }
++  }
++
++  const previous = options.previousV1 === undefined ? null : migratedGlobalConnection(options.previousV1)
++  const existing =
++    registry.connections.find(connection => sameConnectionTarget(connection, candidate)) ||
++    (previous && previous.kind !== 'local'
++      ? registry.connections.find(connection => sameConnectionTarget(connection, previous))
++      : undefined)
++
++  let selected: RegistryConnection
++  let connections: RegistryConnection[]
++
++  if (existing) {
++    selected = {
++      ...candidate,
++      id: existing.id,
++      label: existing.label,
++      // Access-proxy headers are editable only in the v2 registry UI. A
++      // legacy Gateway Settings save for the same URL must not erase them.
++      ...(candidate.headers === undefined && existing.headers !== undefined ? { headers: existing.headers } : {}),
++      // Cloud org is likewise registry-only in some edit flows.
++      ...(candidate.kind === 'cloud' &&
++      existing.kind === 'cloud' &&
++      candidate.org === undefined &&
++      existing.org !== undefined
++        ? { org: existing.org }
++        : {})
++    }
++    connections = registry.connections.map(connection => (connection.id === existing.id ? selected : connection))
++  } else {
++    const label = uniqueLabel(
++      candidate.label,
++      registry.connections.map(connection => connection.label)
++    )
++    const id = connectionIdForLabel(
++      label,
++      registry.connections.map(connection => connection.id)
++    )
++
++    selected = { ...candidate, id, label }
++    connections = [...registry.connections, selected]
++  }
++
++  return {
++    ...registry,
++    connections,
++    primary: selected.id,
++    ...(options.activate ? { lastUsed: selected.id } : {})
++  }
++}
++
++/**
++ * Repair the partial migration produced when connections.json was first read
++ * while connection.json was still local, then a remote was configured later.
++ * Once the registry contains any non-local source it owns its multi-source
++ * shape and must not be overwritten by this compatibility repair.
++ */
++export function reconcileLocalOnlyRegistryFromV1(
++  registry: ConnectionRegistry,
++  v1: unknown
++): ConnectionRegistry {
++  if (registry.connections.some(connection => connection.kind !== 'local')) {
++    return registry
++  }
++
++  if (migratedGlobalConnection(v1).kind === 'local') {
++    return registry
++  }
++
++  return reconcileV1GlobalConnection(registry, v1, { activate: true })
++}
++
+ /** Insert or replace by id. Input must already be normalized/validated. */
+ export function upsertConnection(registry: ConnectionRegistry, entry: RegistryConnection): ConnectionRegistry {
+   const connections = registry.connections.some(c => c.id === entry.id)
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index adf7338ef..d1702c5c0 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -105,6 +105,8 @@ import {
+   migrateV1ToRegistry,
+   normalizeConnectionInput,
+   normalizeRegistry,
++  reconcileLocalOnlyRegistryFromV1,
++  reconcileV1GlobalConnection,
+   rememberSshEnumeration,
+   removeConnection,
+   resolvedConnectionId,
+@@ -8528,6 +8530,15 @@ function readDesktopConnectionsRegistry() {
+     registry = normalizeRegistry(null)
+   }
+ 
++  const repaired = reconcileLocalOnlyRegistryFromV1(registry, readDesktopConnectionConfig())
++
++  if (repaired !== registry) {
++    rememberLog('[connections] repairing stale local-only registry from the configured remote connection')
++    persistReconciledConnectionsRegistry(repaired, 'stale local-only registry repair')
++
++    return connectionRegistryCache
++  }
++
+   connectionRegistryCache = registry
+   connectionRegistryCacheMtime = mtime
+ 
+@@ -8543,6 +8554,29 @@ function writeDesktopConnectionsRegistry(registry) {
+   connectionRegistryCacheMtime = fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
+ }
+ 
++function persistReconciledConnectionsRegistry(registry, context) {
++  try {
++    writeDesktopConnectionsRegistry(registry)
++
++    return true
++  } catch (error) {
++    rememberLog(
++      `[connections] could not persist ${context}: ${
++        error instanceof Error ? error.message : String(error)
++      }; using the reconciled registry for this process`
++    )
++    connectionRegistryCache = registry
++
++    try {
++      connectionRegistryCacheMtime = fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
++    } catch {
++      connectionRegistryCacheMtime = null
++    }
++
++    return false
++  }
++}
++
+ /**
+  * Renderer-facing view of a registry entry: token bytes never cross the IPC
+  * boundary — the renderer gets a preview + set flag, mirroring
+@@ -13246,16 +13280,38 @@ ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl) => {
+   return cloudAgentSilentSignIn(dashboardUrl)
+ })
+ ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
++  const key = connectionScopeKey(payload?.profile)
++  const previousConfig = readDesktopConnectionConfig()
+   const config = coerceDesktopConnectionConfig(payload)
+   writeDesktopConnectionConfig(config)
+ 
++  if (!key) {
++    persistReconciledConnectionsRegistry(
++      reconcileV1GlobalConnection(readDesktopConnectionsRegistry(), config, {
++        previousV1: previousConfig
++      }),
++      'connection settings save'
++    )
++  }
++
+   return sanitizeDesktopConnectionConfig(config, payload?.profile)
+ })
+ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
++  const key = connectionScopeKey(payload?.profile)
++  const previousConfig = readDesktopConnectionConfig()
+   const config = coerceDesktopConnectionConfig(payload)
+   writeDesktopConnectionConfig(config)
+ 
+-  const key = connectionScopeKey(payload?.profile)
++  if (!key) {
++    persistReconciledConnectionsRegistry(
++      reconcileV1GlobalConnection(readDesktopConnectionsRegistry(), config, {
++        activate: true,
++        previousV1: previousConfig
++      }),
++      'connection settings apply'
++    )
++  }
++
+   const scope = key || ''
+ 
+   await applyConnectionChange({
+diff --git a/apps/desktop/src/store/connections.test.ts b/apps/desktop/src/store/connections.test.ts
+index ec92be722..201c9f90d 100644
+--- a/apps/desktop/src/store/connections.test.ts
++++ b/apps/desktop/src/store/connections.test.ts
+@@ -113,6 +113,23 @@ describe('connection registry cache', () => {
+     expect(ensureGatewayAgent).not.toHaveBeenCalled()
+   })
+ 
++  it('never auto-restores local over an already-remote primary boot', async () => {
++    list.mockResolvedValueOnce({
++      ...registry,
++      connections: [registry.connections[0]],
++      lastUsed: 'local',
++      launchMode: 'primary',
++      primary: 'local'
++    })
++    $connection.set({ mode: 'remote' })
++
++    await initializeConnectionsRegistry()
++
++    expect(ensureGatewayAgent).not.toHaveBeenCalled()
++    expect(setLastUsed).not.toHaveBeenCalled()
++    expect($connection.get()?.mode).toBe('remote')
++  })
++
+   it('uses only the resolved descriptor identity for the active gateway', () => {
+     setConnectionsRegistry({ ...registry, primary: 'homelab' })
+     $connection.set({ connectionId: 'work-vps', mode: 'remote' })
+diff --git a/apps/desktop/src/store/connections.ts b/apps/desktop/src/store/connections.ts
+index c97c07ce1..1972c6eaa 100644
+--- a/apps/desktop/src/store/connections.ts
++++ b/apps/desktop/src/store/connections.ts
+@@ -131,8 +131,17 @@ export async function initializeConnectionsRegistry(): Promise<DesktopConnection
+     : registry.primary
+ 
+   const preferredId = registry.launchMode === 'last-used' ? lastUsed : registry.primary
++  const preferred = registry.connections.find(connection => connection.id === preferredId)
+ 
+-  if (!preferredId) {
++  if (!preferred) {
++    return registry
++  }
++
++  // Automatic launch restoration is background policy, not explicit consent
++  // to install a local runtime. If the primary boot is already remote, a stale
++  // or intentionally local registry preference must not invoke the forced-local
++  // backend path; the user can still choose "This device" explicitly.
++  if (preferred.kind === 'local' && $connection.get()?.mode === 'remote') {
+     return registry
+   }
+ 

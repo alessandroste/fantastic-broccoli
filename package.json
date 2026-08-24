@@ -1,0 +1,27 @@
+{
+  "name": "hermes-desktop-windows-wrapper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned Windows portable builds of the Hermes Electron desktop client.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.0",
+    "npm": "<11.10.0 || >=11.17.0"
+  },
+  "scripts": {
+    "setup": "node scripts/wrapper.mjs setup",
+    "setup:submodule": "node scripts/wrapper.mjs submodule",
+    "build": "node scripts/wrapper.mjs build",
+    "build:x64": "node scripts/wrapper.mjs build x64",
+    "build:arm64": "node scripts/wrapper.mjs build arm64",
+    "build:all": "node scripts/wrapper.mjs build-all",
+    "start": "node scripts/wrapper.mjs start",
+    "start:x64": "node scripts/wrapper.mjs start x64",
+    "start:arm64": "node scripts/wrapper.mjs start arm64",
+    "update": "node scripts/wrapper.mjs update",
+    "validate": "node scripts/wrapper.mjs validate",
+    "validate:x64": "node scripts/wrapper.mjs validate x64",
+    "validate:arm64": "node scripts/wrapper.mjs validate arm64",
+    "test": "node --test scripts/wrapper.test.mjs"
+  }
+}
