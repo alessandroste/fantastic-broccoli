@@ -1,9 +1,10 @@
 # Hermes Desktop Windows wrapper
 
 This repository builds the official Hermes Electron Desktop application from a
-pinned `NousResearch/hermes-agent` Git submodule plus a wrapper-owned patch
-series under `patches\`. The upstream checkout remains clean and sparse: only
-`apps/desktop`, `apps/shared`, and the root npm manifests are present.
+pinned `NousResearch/hermes-agent` Git submodule, with support for an optional
+wrapper-owned patch series under `patches\`. The upstream checkout remains clean
+and sparse: only `apps/desktop`, `apps/shared`, and the root npm manifests are
+present.
 
 ## Requirements
 
@@ -27,8 +28,8 @@ npm run update         # build and pin the newest stable vYYYY.M.D tag
 npm run validate       # validate both published artifacts and hashes
 ```
 
-Every build applies `patches\*.patch` in lexical order, records each relative
-path and SHA-256 in the artifact manifest, and reverses the series in a
+Every build applies any `patches\*.patch` files in lexical order, records each
+relative path and SHA-256 in the artifact manifest, and reverses the series in a
 `finally` block. A failed build therefore leaves the pinned submodule clean.
 Validation rejects an artifact built with a different patch set.
 
