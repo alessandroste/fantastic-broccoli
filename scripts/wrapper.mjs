@@ -16,7 +16,6 @@ const STATE_FILES = path.join(STATE, 'state')
 const BUILD_ROOT = path.join(STATE, 'build')
 const NPM_CACHE = path.join(STATE, 'npm-cache')
 const ARTIFACTS = path.join(ROOT, 'artifacts')
-const PATCHES = path.join(ROOT, 'patches')
 const UPSTREAM_METADATA = path.join(ROOT, 'upstream.json')
 const SUBMODULE_PATH = 'upstream/hermes-agent'
 const UPSTREAM_URL = 'https://github.com/NousResearch/hermes-agent.git'
@@ -148,72 +147,6 @@ function sha256File(file) {
   const hash = crypto.createHash('sha256')
   hash.update(fs.readFileSync(file))
   return hash.digest('hex')
-}
-
-function sourcePatchManifest() {
-  if (!fs.existsSync(PATCHES)) {
-    return []
-  }
-
-  return fs
-    .readdirSync(PATCHES, { withFileTypes: true })
-    .filter(entry => entry.isFile() && entry.name.endsWith('.patch'))
-    .map(entry => entry.name)
-    .sort((left, right) => left.localeCompare(right))
-    .map(name => {
-      const file = path.join(PATCHES, name)
-      if (fs.statSync(file).size === 0) {
-        fail(`Source patch is empty: ${file}`)
-      }
-      return {
-        file: path.relative(ROOT, file).replaceAll(path.sep, '/'),
-        sha256: sha256File(file)
-      }
-    })
-}
-
-function patchFile(record) {
-  return path.join(ROOT, ...record.file.split('/'))
-}
-
-function restoreSourcePatches(records) {
-  for (const record of [...records].reverse()) {
-    const file = patchFile(record)
-    git(['-C', UPSTREAM, 'apply', '--reverse', '--index', '--check', '--whitespace=nowarn', '--', file])
-    git(['-C', UPSTREAM, 'apply', '--reverse', '--index', '--whitespace=nowarn', '--', file])
-  }
-}
-
-function applySourcePatches() {
-  const records = sourcePatchManifest()
-  const applied = []
-
-  try {
-    for (const record of records) {
-      const file = patchFile(record)
-      git(['-C', UPSTREAM, 'apply', '--index', '--check', '--whitespace=error-all', '--', file])
-      git(['-C', UPSTREAM, 'apply', '--index', '--whitespace=error-all', '--', file])
-      applied.push(record)
-      console.log(`[wrapper] Applied ${record.file} (${record.sha256.slice(0, 12)}).`)
-    }
-  } catch (error) {
-    restoreSourcePatches(applied)
-    throw error
-  }
-
-  return {
-    records,
-    restore() {
-      restoreSourcePatches(applied)
-      if (applied.length > 0) {
-        console.log('[wrapper] Restored clean pinned submodule after patched build.')
-      }
-    }
-  }
-}
-
-function manifestMatchesPatchSet(manifest, patches = sourcePatchManifest()) {
-  return sameJson(manifest?.source?.patches ?? [], patches)
 }
 
 function submoduleGitlink() {
@@ -421,8 +354,7 @@ function dependencyFingerprint(arch) {
     lockfileSha256: sha256File(path.join(UPSTREAM, 'package-lock.json')),
     node: process.version,
     npm: npmOutput(['--version']),
-    platform: process.platform,
-    sourcePatches: sourcePatchManifest()
+    platform: process.platform
   }
 }
 
@@ -594,14 +526,11 @@ function publishBuild({ arch, release, desktopVersion, validation, dependencyInf
   }
 
   const manifest = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     repository: release.repository,
     tag: release.tag,
     commit: release.commit,
     desktopVersion,
-    source: {
-      patches: dependencyInfo.sourcePatches
-    },
     target: {
       platform: 'win32',
       arch
@@ -645,68 +574,60 @@ function buildTarget(rawArch, options = {}) {
     fail(`Checked-out Hermes commit does not match build release ${release.commit}.`)
   }
   assertCleanUpstream()
-  const patchTransaction = applySourcePatches()
-  let result
+  const dependencyInfo = ensureDependencies(arch)
+  const desktopPackage = readJson(path.join(DESKTOP, 'package.json'))
+  const desktopVersion = desktopPackage.version
+  const outputDir =
+    options.outputDir ?? path.join(BUILD_ROOT, `${release.tag}-${release.commit.slice(0, 12)}`, arch)
+  removeDir(outputDir)
+  ensureDir(outputDir)
 
-  try {
-    const dependencyInfo = ensureDependencies(arch)
-    const desktopPackage = readJson(path.join(DESKTOP, 'package.json'))
-    const desktopVersion = desktopPackage.version
-    const outputDir =
-      options.outputDir ?? path.join(BUILD_ROOT, `${release.tag}-${release.commit.slice(0, 12)}`, arch)
-    removeDir(outputDir)
-    ensureDir(outputDir)
+  const env = targetNpmEnvironment(arch)
+  env.GITHUB_SHA = release.commit
+  env.GITHUB_REF_NAME = release.tag
 
-    const env = targetNpmEnvironment(arch)
-    env.GITHUB_SHA = release.commit
-    env.GITHUB_REF_NAME = release.tag
+  console.log(`[wrapper] Compiling Hermes Desktop ${release.tag} for win32-${arch}...`)
+  runNpm(['run', 'build', '--workspace', 'hermes'], {
+    cwd: UPSTREAM,
+    env
+  })
 
-    console.log(`[wrapper] Compiling Hermes Desktop ${release.tag} for win32-${arch}...`)
-    runNpm(['run', 'build', '--workspace', 'hermes'], {
-      cwd: UPSTREAM,
-      env
-    })
-
-    assertPeArch(electronExe(), arch)
-    if (arch === 'arm64') {
-      patchPortableNsisTemplate()
-    }
-    console.log(`[wrapper] Packaging portable win32-${arch} executable...`)
-    const builderArgs = [
-      'run',
-      'builder',
-      '--workspace',
-      'hermes',
-      '--',
-      '--win',
-      'portable',
-      `--${arch}`,
-      '--publish',
-      'never',
-      `-c.directories.output=${outputDir}`
-    ]
-    if (arch === 'arm64') {
-      builderArgs.push('--config.portable.useZip=true')
-    }
-    runNpm(builderArgs, {
-      cwd: UPSTREAM,
-      env
-    })
-
-    const validation = validateBuildOutput({ arch, outputDir, release })
-    result = {
-      arch,
-      release,
-      desktopVersion,
-      outputDir,
-      validation,
-      dependencyInfo
-    }
-  } finally {
-    patchTransaction.restore()
+  assertPeArch(electronExe(), arch)
+  if (arch === 'arm64') {
+    patchPortableNsisTemplate()
   }
+  console.log(`[wrapper] Packaging portable win32-${arch} executable...`)
+  const builderArgs = [
+    'run',
+    'builder',
+    '--workspace',
+    'hermes',
+    '--',
+    '--win',
+    'portable',
+    `--${arch}`,
+    '--publish',
+    'never',
+    `-c.directories.output=${outputDir}`
+  ]
+  if (arch === 'arm64') {
+    builderArgs.push('--config.portable.useZip=true')
+  }
+  runNpm(builderArgs, {
+    cwd: UPSTREAM,
+    env
+  })
 
+  const validation = validateBuildOutput({ arch, outputDir, release })
   assertCleanUpstream()
+  const result = {
+    arch,
+    release,
+    desktopVersion,
+    outputDir,
+    validation,
+    dependencyInfo
+  }
   return options.publish === false ? result : { ...result, published: publishBuild(result) }
 }
 
@@ -727,9 +648,6 @@ function validatePublished(rawArch) {
   }
   if (manifest.commit !== submoduleGitlink()) {
     fail(`Artifact ${arch} was built from ${manifest.commit}, not the staged wrapper gitlink ${submoduleGitlink()}.`)
-  }
-  if (!manifestMatchesPatchSet(manifest)) {
-    fail(`Artifact ${arch} was not built with the wrapper's current source patch set.`)
   }
   console.log(`[wrapper] ${arch} artifact validated: ${manifest.artifact.file} (${digest}).`)
   return manifest
@@ -783,7 +701,7 @@ async function startTarget(rawArch) {
   const release = ensureSubmodule()
   const activeFile = path.join(STATE_FILES, `active-${arch}.json`)
   let manifest = fs.existsSync(activeFile) ? readJson(activeFile) : null
-  if (!manifest || manifest.commit !== release.commit || !manifestMatchesPatchSet(manifest)) {
+  if (!manifest || manifest.commit !== release.commit) {
     console.log(`[wrapper] No current ${arch} artifact; building it first.`)
     buildTarget(arch)
     manifest = readJson(activeFile)
@@ -990,12 +908,7 @@ function updateLatestStable() {
 async function setup() {
   requireWindows()
   ensureSubmodule()
-  const patchTransaction = applySourcePatches()
-  try {
-    ensureDependencies(requireTarget(process.arch))
-  } finally {
-    patchTransaction.restore()
-  }
+  ensureDependencies(requireTarget(process.arch))
   assertCleanUpstream()
   console.log('[wrapper] Setup complete.')
 }
@@ -1048,7 +961,6 @@ if (invokedAsScript) {
 }
 
 export {
-  manifestMatchesPatchSet,
   PE_MACHINES,
   parseStableRefs,
   readPeMachine,

@@ -1,10 +1,9 @@
 # Hermes Desktop Windows wrapper
 
 This repository builds the official Hermes Electron Desktop application from a
-pinned `NousResearch/hermes-agent` Git submodule, with support for an optional
-wrapper-owned patch series under `patches\`. The upstream checkout remains clean
-and sparse: only `apps/desktop`, `apps/shared`, and the root npm manifests are
-present.
+pinned `NousResearch/hermes-agent` Git submodule. The upstream checkout remains
+clean and sparse: only `apps/desktop`, `apps/shared`, and the root npm manifests
+are present.
 
 ## Requirements
 
@@ -27,11 +26,6 @@ npm start              # build if stale, then launch the native artifact
 npm run update         # build and pin the newest stable vYYYY.M.D tag
 npm run validate       # validate both published artifacts and hashes
 ```
-
-Every build applies any `patches\*.patch` files in lexical order, records each
-relative path and SHA-256 in the artifact manifest, and reverses the series in a
-`finally` block. A failed build therefore leaves the pinned submodule clean.
-Validation rejects an artifact built with a different patch set.
 
 An ARM64 Windows host can cross-build x64. The wrapper reinstalls the selected
 workspace dependencies for x64, verifies that Electron and every packaged
@@ -85,22 +79,9 @@ Sparse patterns are local Git worktree settings and cannot be fully stored in
 `.gitmodules`. `npm run setup` is therefore the authoritative initializer and
 repair command.
 
-Wrapper-specific Hermes changes belong in the patch series, not as a dirty
-submodule. To refresh a patch after editing the sparse checkout, capture the
-diff before running any wrapper command (setup forcibly restores the pinned
-commit):
-
-```powershell
-New-Item -ItemType Directory -Force patches | Out-Null
-cmd /c "git -C upstream\hermes-agent diff --binary > patches\001-desktop-remote-client.patch"
-$changed = git -C upstream\hermes-agent diff --name-only
-git -C upstream\hermes-agent restore --worktree -- $changed
-git -C upstream\hermes-agent status --short  # must be empty
-```
-
-When `npm run update` advances the pinned tag, the candidate build applies the
-same series to the new commit. A patch that no longer applies aborts the update
-transaction so it can be rebased deliberately instead of silently omitted.
+Hermes source changes should be contributed upstream rather than stored as
+submodule modifications. Wrapper-specific build and packaging behavior belongs
+in `scripts\wrapper.mjs`.
 
 ## Releases and versioning
 
@@ -110,18 +91,18 @@ never start builds. Release versions use the pinned upstream tag plus a wrapper
 revision:
 
 ```text
-upstream v2026.8.19 + revision 1 -> v2026.8.19-r1
-upstream v2026.8.19 + revision 2 -> v2026.8.19-r2
+upstream v2026.8.31 + revision 1 -> v2026.8.31-r1
+upstream v2026.8.31 + revision 2 -> v2026.8.31-r2
 upstream v2026.9.2  + revision 1 -> v2026.9.2-r1
 ```
 
-Increment the revision when wrapper code or patches change without moving
-upstream. Reset it to `1` after `npm run update` advances the upstream tag.
-The tag must match the current `upstream.json` value exactly:
+Increment the revision when wrapper code changes without moving upstream. Reset
+it to `1` after `npm run update` advances the upstream tag. The tag must match
+the current `upstream.json` value exactly:
 
 ```powershell
-git tag -a v2026.8.19-r1 -m "Hermes Desktop v2026.8.19-r1"
-git push origin v2026.8.19-r1
+git tag -a v2026.8.31-r1 -m "Hermes Desktop v2026.8.31-r1"
+git push origin v2026.8.31-r1
 ```
 
 Pushing the tag publishes the release automatically. Alternatively, run
@@ -136,10 +117,10 @@ Release assets contain only the two versioned portable executables, their
 individual checksum files, and `SHA256SUMS.txt`:
 
 ```text
-Hermes-2026.8.19-r1-win-x64.exe
-Hermes-2026.8.19-r1-win-x64.exe.sha256
-Hermes-2026.8.19-r1-win-arm64.exe
-Hermes-2026.8.19-r1-win-arm64.exe.sha256
+Hermes-2026.8.31-r1-win-x64.exe
+Hermes-2026.8.31-r1-win-x64.exe.sha256
+Hermes-2026.8.31-r1-win-arm64.exe
+Hermes-2026.8.31-r1-win-arm64.exe.sha256
 SHA256SUMS.txt
 ```
 

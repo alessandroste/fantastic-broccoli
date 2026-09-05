@@ -4,13 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import {
-  manifestMatchesPatchSet,
-  PE_MACHINES,
-  parseStableRefs,
-  readPeMachine,
-  requireTarget
-} from './wrapper.mjs'
+import { PE_MACHINES, parseStableRefs, readPeMachine, requireTarget } from './wrapper.mjs'
 
 test('parseStableRefs selects numeric date tags and peels annotated tags', () => {
   const refs = parseStableRefs(
@@ -54,17 +48,4 @@ test('requireTarget accepts only supported Windows architectures', () => {
   assert.equal(requireTarget('x64'), 'x64')
   assert.equal(requireTarget('arm64'), 'arm64')
   assert.throws(() => requireTarget('ia32'), /Unsupported Windows architecture/)
-})
-
-test('manifestMatchesPatchSet requires exact ordered patch provenance', () => {
-  const patches = [
-    { file: 'patches/001-a.patch', sha256: 'a'.repeat(64) },
-    { file: 'patches/002-b.patch', sha256: 'b'.repeat(64) }
-  ]
-  const manifest = { source: { patches } }
-
-  assert.equal(manifestMatchesPatchSet(manifest, patches), true)
-  assert.equal(manifestMatchesPatchSet({ source: { patches: patches.slice(0, 1) } }, patches), false)
-  assert.equal(manifestMatchesPatchSet({ source: { patches: [...patches].reverse() } }, patches), false)
-  assert.equal(manifestMatchesPatchSet({ schemaVersion: 1 }, patches), false)
 })
