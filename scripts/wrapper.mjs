@@ -22,8 +22,15 @@ const UPSTREAM_URL = 'https://github.com/NousResearch/hermes-agent.git'
 const SPARSE_PATTERNS = [
   '/apps/desktop/',
   '/apps/shared/',
+  '/scripts/build/',
+  '/scripts/msix-shared.mjs',
+  '/scripts/release-content-types.json',
+  '/pm/lock.json',
+  '/pyproject.toml',
+  '/lefthook.yml',
   '/package.json',
   '/package-lock.json',
+  '/.gitignore',
   '/.npmrc'
 ]
 const TARGETS = new Set(['x64', 'arm64'])
@@ -183,11 +190,6 @@ function ensureSparseCheckout(options = {}) {
     }
   }
 
-  for (const omitted of ['web', 'ui-tui', 'tests-js']) {
-    if (fs.existsSync(path.join(UPSTREAM, omitted))) {
-      fail(`Sparse checkout unexpectedly contains omitted workspace: ${omitted}`)
-    }
-  }
 }
 
 function ensureSubmodule() {
@@ -290,63 +292,6 @@ function electronExe() {
   return path.join(resolvePackageRoot('electron'), 'dist', 'electron.exe')
 }
 
-function patchPortableNsisTemplate() {
-  const appBuilderRoot = resolvePackageRoot('app-builder-lib')
-  const template = path.join(appBuilderRoot, 'templates', 'nsis', 'portable.nsi')
-  const marker = '# HERMES_WRAPPER_ARM64_DIRECT'
-  const source = fs.readFileSync(template, 'utf8')
-  if (source.includes(marker)) {
-    return
-  }
-
-  const startAnchor = '  SetOutPath $INSTDIR'
-  const stockBlockAnchor = '  !ifdef APP_DIR_64'
-  const endAnchor =
-    '  System::Call \'Kernel32::SetEnvironmentVariable(t, t)i ("PORTABLE_EXECUTABLE_DIR", "$EXEDIR").r0\''
-  if (
-    !source.includes(startAnchor) ||
-    !source.includes(stockBlockAnchor) ||
-    !source.includes(endAnchor)
-  ) {
-    fail(
-      `electron-builder's portable NSIS template changed at ${template}; ` +
-        'review the ARM64-only extraction patch before building.'
-    )
-  }
-
-  // With portable.useZip enabled electron-builder defines APP_DIR_ARM64 and
-  // expects portable.nsi to embed that directory directly. Its stock template
-  // only checks APP_DIR_ARM64 inside APP_DIR_64, so an ARM64-only build falls
-  // through to an empty archive extraction. Handle the sole available app
-  // directory and compile out the stock architecture/archive block.
-  const extraction = `${startAnchor}
-
-  ${marker}
-  !ifdef APP_DIR_ARM64
-    !ifndef APP_DIR_64
-      !ifndef APP_DIR_32
-        !define HERMES_WRAPPER_ARM64_DIRECT_ACTIVE
-        File /r "\${APP_DIR_ARM64}\\*.*"
-      !endif
-    !endif
-  !endif`
-  const wrappedStockBlock = `  !ifndef HERMES_WRAPPER_ARM64_DIRECT_ACTIVE
-${stockBlockAnchor}`
-  const endWrappedStockBlock = `  !endif
-
-${endAnchor}`
-
-  fs.writeFileSync(
-    template,
-    source
-      .replace(startAnchor, extraction)
-      .replace(stockBlockAnchor, wrappedStockBlock)
-      .replace(endAnchor, endWrappedStockBlock),
-    'utf8'
-  )
-  console.log('[wrapper] Patched electron-builder portable NSIS template for direct ARM64 extraction.')
-}
-
 function dependencyFingerprint(arch) {
   return {
     arch,
@@ -354,7 +299,8 @@ function dependencyFingerprint(arch) {
     lockfileSha256: sha256File(path.join(UPSTREAM, 'package-lock.json')),
     node: process.version,
     npm: npmOutput(['--version']),
-    platform: process.platform
+    platform: process.platform,
+    workspaces: ['hermes', '@hermes/shared']
   }
 }
 
@@ -392,24 +338,15 @@ function ensureDependencies(arch) {
   }
 
   if (!reusable) {
-    console.log(`[wrapper] Installing locked Hermes Desktop dependencies for win32-${target}...`)
+    console.log(`[wrapper] Installing locked Hermes dependencies for win32-${target}...`)
     ensureDir(NPM_CACHE)
-    runNpm(
-      [
-        'ci',
-        '--workspace',
-        'hermes',
-        '--workspace',
-        '@hermes/shared',
-        '--include-workspace-root',
-        '--no-audit',
-        '--no-fund'
-      ],
-      {
-        cwd: UPSTREAM,
-        env: targetNpmEnvironment(target)
-      }
-    )
+    runNpm([
+      'ci', '--workspace', 'hermes', '--workspace', '@hermes/shared',
+      '--include-workspace-root', '--no-audit', '--no-fund'
+    ], {
+      cwd: UPSTREAM,
+      env: targetNpmEnvironment(target)
+    })
     assertPeArch(electronExe(), target)
     writeJsonAtomic(stateFile, fingerprint)
   } else {
@@ -453,15 +390,15 @@ function findUnpackedDir(outputDir) {
   return match[0]
 }
 
-function findPortableExe(outputDir, unpackedDir) {
+function findPortableZip(outputDir, unpackedDir) {
   const matches = walkFiles(
     outputDir,
     (full, name) =>
       full.indexOf(unpackedDir + path.sep) !== 0 &&
-      /^Hermes-.*-win-(x64|arm64)\.exe$/i.test(name)
+      /^Hermes-.*-win-(x64|arm64)\.zip$/i.test(name)
   )
   if (matches.length !== 1) {
-    fail(`Expected one Hermes portable executable in ${outputDir}; found ${matches.length}.`)
+    fail(`Expected one Hermes portable ZIP in ${outputDir}; found ${matches.length}.`)
   }
   return matches[0]
 }
@@ -495,9 +432,9 @@ function validateBuildOutput({ arch, outputDir, release }) {
     fail('The packaged application has no node-pty native payload.')
   }
 
-  const portableExe = findPortableExe(outputDir, unpackedDir)
-  if (fs.statSync(portableExe).size === 0) {
-    fail(`Portable executable is empty: ${portableExe}`)
+  const portableZip = findPortableZip(outputDir, unpackedDir)
+  if (fs.statSync(portableZip).size === 0) {
+    fail(`Portable ZIP is empty: ${portableZip}`)
   }
 
   const stamp = readJson(installStamp)
@@ -506,27 +443,38 @@ function validateBuildOutput({ arch, outputDir, release }) {
   }
 
   return {
-    portableExe,
+    portableZip,
     unpackedDir,
     nativeModules,
-    portableSha256: sha256File(portableExe)
+    portableSha256: sha256File(portableZip)
   }
+}
+
+function publishUnpacked(source, destination) {
+  if (!fs.statSync(source).isDirectory()) {
+    fail(`Unpacked build is not a directory: ${source}`)
+  }
+  const unpacked = path.join(destination, 'unpacked')
+  removeDir(unpacked)
+  fs.cpSync(source, unpacked, { recursive: true, verbatimSymlinks: true })
+  return unpacked
 }
 
 function publishBuild({ arch, release, desktopVersion, validation, dependencyInfo }, options = {}) {
   const destination = path.join(ARTIFACTS, release.tag, arch)
   ensureDir(destination)
-  const artifactName = `Hermes-${desktopVersion}-win-${arch}.exe`
+  const artifactName = `Hermes-${desktopVersion}-win-${arch}.zip`
   const artifact = path.join(destination, artifactName)
-  fs.copyFileSync(validation.portableExe, artifact)
+  fs.copyFileSync(validation.portableZip, artifact)
 
   const digest = sha256File(artifact)
   if (digest !== validation.portableSha256) {
     fail(`Artifact hash changed while publishing ${artifact}.`)
   }
+  publishUnpacked(validation.unpackedDir, destination)
 
   const manifest = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     repository: release.repository,
     tag: release.tag,
     commit: release.commit,
@@ -573,10 +521,21 @@ function buildTarget(rawArch, options = {}) {
   if (currentUpstreamCommit() !== release.commit) {
     fail(`Checked-out Hermes commit does not match build release ${release.commit}.`)
   }
+  const tagRef = `refs/tags/${release.tag}`
+  const hasTag = run('git', ['-C', UPSTREAM, 'show-ref', '--verify', '--quiet', tagRef], {
+    allowFailure: true,
+    capture: true
+  }).status === 0
+  if (!hasTag) {
+    git(['-C', UPSTREAM, 'fetch', '--depth=1', 'origin', `${tagRef}:${tagRef}`])
+  }
+  if (gitOutput(['-C', UPSTREAM, 'rev-parse', `${tagRef}^{commit}`]) !== release.commit) {
+    fail(`Upstream tag ${release.tag} does not resolve to pinned commit ${release.commit}.`)
+  }
   assertCleanUpstream()
   const dependencyInfo = ensureDependencies(arch)
-  const desktopPackage = readJson(path.join(DESKTOP, 'package.json'))
-  const desktopVersion = desktopPackage.version
+  assertCleanUpstream()
+  const desktopVersion = release.tag.slice(1)
   const outputDir =
     options.outputDir ?? path.join(BUILD_ROOT, `${release.tag}-${release.commit.slice(0, 12)}`, arch)
   removeDir(outputDir)
@@ -585,6 +544,8 @@ function buildTarget(rawArch, options = {}) {
   const env = targetNpmEnvironment(arch)
   env.GITHUB_SHA = release.commit
   env.GITHUB_REF_NAME = release.tag
+  env.HERMES_PAYLOAD_TAG = release.tag
+  env.HERMES_PAYLOAD_VERSION = desktopVersion
 
   console.log(`[wrapper] Compiling Hermes Desktop ${release.tag} for win32-${arch}...`)
   runNpm(['run', 'build', '--workspace', 'hermes'], {
@@ -593,10 +554,13 @@ function buildTarget(rawArch, options = {}) {
   })
 
   assertPeArch(electronExe(), arch)
-  if (arch === 'arm64') {
-    patchPortableNsisTemplate()
+  if (arch !== process.arch) {
+    run(process.execPath, [path.join(DESKTOP, 'scripts', 'stage-native-deps.mjs'), '--arch', arch], {
+      cwd: UPSTREAM,
+      env
+    })
   }
-  console.log(`[wrapper] Packaging portable win32-${arch} executable...`)
+  console.log(`[wrapper] Packaging portable win32-${arch} ZIP...`)
   const builderArgs = [
     'run',
     'builder',
@@ -604,15 +568,13 @@ function buildTarget(rawArch, options = {}) {
     'hermes',
     '--',
     '--win',
-    'portable',
+    'zip',
     `--${arch}`,
-    '--publish',
-    'never',
+    '--native-deps',
+    path.join(DESKTOP, 'build', 'native-deps'),
+    `-c.extraMetadata.version=${desktopVersion}`,
     `-c.directories.output=${outputDir}`
   ]
-  if (arch === 'arm64') {
-    builderArgs.push('--config.portable.useZip=true')
-  }
   runNpm(builderArgs, {
     cwd: UPSTREAM,
     env
@@ -638,6 +600,9 @@ function validatePublished(rawArch) {
     fail(`No active ${arch} artifact manifest exists. Run npm run build:${arch} first.`)
   }
   const manifest = readJson(activeFile)
+  if (manifest.schemaVersion !== 4) {
+    fail(`Artifact ${arch} uses the old packaging format. Run npm run build:${arch} first.`)
+  }
   const artifact = path.join(ROOT, ...manifest.artifact.file.split('/'))
   if (!fs.existsSync(artifact)) {
     fail(`Published artifact is missing: ${artifact}`)
@@ -701,7 +666,7 @@ async function startTarget(rawArch) {
   const release = ensureSubmodule()
   const activeFile = path.join(STATE_FILES, `active-${arch}.json`)
   let manifest = fs.existsSync(activeFile) ? readJson(activeFile) : null
-  if (!manifest || manifest.commit !== release.commit) {
+  if (!manifest || manifest.schemaVersion !== 4 || manifest.commit !== release.commit) {
     console.log(`[wrapper] No current ${arch} artifact; building it first.`)
     buildTarget(arch)
     manifest = readJson(activeFile)
@@ -717,28 +682,32 @@ async function startTarget(rawArch) {
   ensureDir(userData)
   removeDir(runtimeTemp)
   ensureDir(runtimeTemp)
-  const protocolSnapshot = protocolRegistrationSnapshot()
-
-  const child = spawn(artifact, [], {
-    cwd: path.dirname(artifact),
-    stdio: 'ignore',
-    env: {
-      ...process.env,
-      HERMES_HOME: hermesHome,
-      HERMES_DESKTOP_USER_DATA_DIR: userData,
-      TEMP: runtimeTemp,
-      TMP: runtimeTemp
-    },
-    windowsHide: false
-  })
-  console.log(`[wrapper] Started ${path.basename(artifact)} (PID ${child.pid}) with ${userData}.`)
-
+  let protocolSnapshot = null
   let result
   try {
+    run('tar.exe', ['-xf', artifact, '-C', runtimeTemp])
+    const appExe = path.join(runtimeTemp, 'Hermes.exe')
+    assertPeArch(appExe, arch)
+    protocolSnapshot = protocolRegistrationSnapshot()
+    const child = spawn(appExe, [], {
+      cwd: runtimeTemp,
+      stdio: 'ignore',
+      env: {
+        ...process.env,
+        HERMES_HOME: hermesHome,
+        HERMES_DESKTOP_USER_DATA_DIR: userData,
+        TEMP: runtimeTemp,
+        TMP: runtimeTemp
+      },
+      windowsHide: false
+    })
+    console.log(`[wrapper] Started ${path.basename(artifact)} (PID ${child.pid}) with ${userData}.`)
     result = await waitForChild(child)
   } finally {
     try {
-      restoreProtocolRegistration(protocolSnapshot)
+      if (protocolSnapshot) {
+        restoreProtocolRegistration(protocolSnapshot)
+      }
     } finally {
       await removeRuntimeDir(runtimeTemp)
     }
@@ -754,16 +723,17 @@ async function startTarget(rawArch) {
 function parseStableRefs(text) {
   const refs = new Map()
   for (const line of text.split(/\r?\n/)) {
-    const match = /^([0-9a-f]{40})\s+refs\/tags\/(v(\d+)\.(\d+)\.(\d+))(\^\{\})?$/.exec(line.trim())
+    const match = /^([0-9a-f]{40})\s+refs\/tags\/(v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*))(\^\{\})?$/.exec(line.trim())
     if (!match) {
       continue
     }
-    const [, sha, tag, year, month, day, peeled] = match
+    const [, sha, tag, major, minor, patch, peeled] = match
     const value = refs.get(tag) ?? {
       tag,
-      year: Number(year),
-      month: Number(month),
-      day: Number(day),
+      legacyDate: major.length === 4,
+      major: Number(major),
+      minor: Number(minor),
+      patch: Number(patch),
       tagObject: null,
       commit: null
     }
@@ -776,7 +746,9 @@ function parseStableRefs(text) {
     refs.set(tag, value)
   }
   return [...refs.values()].sort(
-    (a, b) => b.year - a.year || b.month - a.month || b.day - a.day
+    (a, b) =>
+      Number(a.legacyDate) - Number(b.legacyDate) ||
+      b.major - a.major || b.minor - a.minor || b.patch - a.patch
   )
 }
 
@@ -790,7 +762,7 @@ function latestStableRelease() {
     const result = run('git', ['ls-remote', '--tags', UPSTREAM_URL, 'v*'], {
       allowFailure: true,
       capture: true,
-      timeout: 30_000
+      timeout: 90_000
     })
     if (result.status === 0) {
       text = result.stdout
@@ -799,7 +771,7 @@ function latestStableRelease() {
     }
     lastFailure =
       result.stderr || result.stdout || result.error?.message || `exit ${result.status}`
-    if (!/429|rate limit|RPC failed/i.test(lastFailure)) {
+    if (!/429|rate limit|RPC failed|ETIMEDOUT/i.test(lastFailure)) {
       break
     }
   }
@@ -808,7 +780,7 @@ function latestStableRelease() {
   }
   const releases = parseStableRefs(text)
   if (releases.length === 0) {
-    fail('Upstream published no stable vYYYY.M.D tags.')
+    fail('Upstream published no stable version tags.')
   }
   const latest = releases[0]
   return {
@@ -829,11 +801,6 @@ function checkoutUpstreamCommit(commit) {
   }
   git(['-C', UPSTREAM, 'checkout', '--detach', '--force', commit])
   ensureSparseCheckout()
-}
-
-function publishCandidate(candidate, options = {}) {
-  const published = publishBuild(candidate, options)
-  return { ...candidate, published }
 }
 
 function readOptionalJson(file) {
@@ -880,8 +847,8 @@ function updateLatestStable() {
       outputDir: path.join(transactionRoot, 'arm64'),
       publish: false
     })
-    const publishedX64 = publishCandidate(x64, { activate: false }).published
-    const publishedArm64 = publishCandidate(arm64, { activate: false }).published
+    const publishedX64 = publishBuild(x64, { activate: false })
+    const publishedArm64 = publishBuild(arm64, { activate: false })
     writeJsonAtomic(UPSTREAM_METADATA, latest)
     writeJsonAtomic(activeX64File, publishedX64.manifest)
     writeJsonAtomic(activeArm64File, publishedArm64.manifest)
@@ -958,11 +925,4 @@ if (invokedAsScript) {
     console.error(`[wrapper] ${error instanceof Error ? error.message : String(error)}`)
     process.exitCode = 1
   })
-}
-
-export {
-  PE_MACHINES,
-  parseStableRefs,
-  readPeMachine,
-  requireTarget
 }

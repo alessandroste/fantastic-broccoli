@@ -56,7 +56,7 @@ jobs:
           const fs = require('node:fs')
 
           const upstream = JSON.parse(fs.readFileSync('upstream.json', 'utf8'))
-          if (!/^v[0-9]{4}\.[0-9]+\.[0-9]+$/.test(upstream.tag)) {
+          if (!/^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(upstream.tag)) {
             throw new Error(`Invalid pinned upstream tag "${upstream.tag}".`)
           }
 
@@ -123,10 +123,6 @@ jobs:
         with:
           node-version: 26.7.0
 
-      - name: Initialize sparse Hermes submodule
-        shell: pwsh
-        run: node scripts/wrapper.mjs submodule
-
       - name: Assert runner architecture
         shell: pwsh
         run: |
@@ -135,11 +131,7 @@ jobs:
             throw "Expected win32-${{ matrix.arch }}, got $actual"
           }
 
-      - name: Set up dependencies
-        shell: pwsh
-        run: npm run setup
-
-      - name: Build portable executable
+      - name: Build portable ZIP
         shell: pwsh
         run: npm run build:${{ matrix.arch }}
 
@@ -153,9 +145,10 @@ jobs:
         with:
           name: hermes-windows-${{ needs.prepare.outputs.release_tag }}-${{ matrix.arch }}
           path: |
-            artifacts/**/${{ matrix.arch }}/*.exe
+            artifacts/**/${{ matrix.arch }}/*.zip
             artifacts/**/${{ matrix.arch }}/*.sha256
             artifacts/**/${{ matrix.arch }}/manifest.json
+            artifacts/**/${{ matrix.arch }}/unpacked/**
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -185,19 +178,19 @@ jobs:
           mkdir release-assets
 
           for arch in x64 arm64; do
-            source="$(find downloaded -type f -name "Hermes-*-win-${arch}.exe" -print -quit)"
+            source="$(find downloaded -type f -name "Hermes-*-win-${arch}.zip" -print -quit)"
             if [[ -z "$source" ]]; then
-              echo "::error::Missing ${arch} portable executable."
+              echo "::error::Missing ${arch} portable ZIP."
               exit 1
             fi
 
-            name="Hermes-${ASSET_VERSION}-win-${arch}.exe"
+            name="Hermes-${ASSET_VERSION}-win-${arch}.zip"
             cp "$source" "release-assets/$name"
             digest="$(sha256sum "release-assets/$name" | awk '{print $1}')"
             printf '%s  %s\n' "$digest" "$name" >"release-assets/$name.sha256"
           done
 
-          cat release-assets/*.exe.sha256 >release-assets/SHA256SUMS.txt
+          cat release-assets/*.zip.sha256 >release-assets/SHA256SUMS.txt
 
       - name: Create GitHub Release
         shell: bash

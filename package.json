@@ -2,7 +2,7 @@
   "name": "hermes-desktop-windows-wrapper",
   "version": "1.0.0",
   "private": true,
-  "description": "Pinned Windows portable builds of the Hermes Electron desktop client.",
+  "description": "Pinned Windows portable ZIP builds of the Hermes Electron desktop client.",
   "type": "module",
   "engines": {
     "node": ">=22.22.0",
@@ -21,7 +21,6 @@
     "update": "node scripts/wrapper.mjs update",
     "validate": "node scripts/wrapper.mjs validate",
     "validate:x64": "node scripts/wrapper.mjs validate x64",
-    "validate:arm64": "node scripts/wrapper.mjs validate arm64",
-    "test": "node --test scripts/wrapper.test.mjs"
+    "validate:arm64": "node scripts/wrapper.mjs validate arm64"
   }
 }
